@@ -1,4 +1,4 @@
-.PHONEY: clean run
+.PHONY: clean run
 
 all: help
 
@@ -9,7 +9,7 @@ clean:
 	-rm -f macpaste
 
 macpaste: macpaste.c
-	gcc -O2 -framework ApplicationServices -o macpaste macpaste.c
+	gcc -O2 -Wall -Wextra -framework ApplicationServices -o macpaste macpaste.c
 
 run:
 	./macpaste
