@@ -17,6 +17,18 @@ Only the middle mouse button (button 2) pastes; side/back buttons (button 3+) do
 
 If your mouse is left-handed, or you remapped the keystrokes, then just edit the C program and recompile.
 
+#### Optional: Click-through (-t)
+
+Normally macOS swallows the first click on a background window: the window activates, but the click never reaches the content (links, buttons), so you must click a second time. With `-t`, macpaste watches for left clicks on windows of non-frontmost apps, activates the app, and re-posts the click about 100 ms later, so the first click also acts on the content.
+
+Notes:
+
+- Drags are passed through untouched (a press-and-drag on a background window behaves as usual).
+- Clicks on the Dock and menu bar are never re-posted.
+- Apps with their own click-through (Terminal, iTerm2) still receive exactly one completed click.
+- Double-clicking text in a background window may select a word on the first click instead of just placing the cursor.
+- `-x "App Name"` opts an app out of click-through entirely, e.g. `./macpaste -t -x "Google Chrome"`.
+
 ## Permissions
 macpaste needs **Accessibility** permission only (System Settings > Privacy & Security > Accessibility). This is the same permission the event tap already requires. **Screen Recording permission is not needed** - window detection uses the Accessibility API (AXUIElement), not screen capture.
 
@@ -32,11 +44,15 @@ To install as a LaunchAgent that starts at login and restarts automatically, run
 
 -c Uses Ctrl instead of Cmd
 
+-t Enables click-through (see above): the first click on a background window also clicks through to the content instead of only activating the window. Off by default.
+
+-x "App Name" Disables click-through for that application. Only meaningful with -t.
+
 -n "App Name" Don't focus window before pasting by simulating left click. This was the default behavior, but causes browsers to do weird things trying to open tabs by middle clicking.
 
 -v Verbose mode. Logs some extra info.
 
-App names for -s/-n are matched **case-insensitively** against each application's display name (resolved from its bundle Info.plist, e.g. "VirtualBox VM" matches the VM window). If an app exposes no Accessibility elements, it simply isn't matched and pasting proceeds normally.
+App names for -s/-n/-x are matched **case-insensitively** against each application's display name (resolved from its bundle Info.plist, e.g. "VirtualBox VM" matches the VM window). If an app exposes no Accessibility elements, it simply isn't matched and pasting proceeds normally.
 
 ## Example setup (run.sh)
 
@@ -45,6 +61,7 @@ The author's daily config, showing `-s`/`-n` in practice. The comment next to ea
 ```bash
 #!/usr/bin/env bash
 # -v logs; -c uses Ctrl (not Cmd) as the copy/paste modifier
+# -t click-through: first click on a background window clicks through (links, buttons)
 ./macpaste -v -c \
     -s "VirtualBox VM"   # guest owns its clipboard; a local Cmd+V would fight the VM's
     -s "Screen Sharing"  # remote Mac handles its own paste; posting Cmd+V would double-fire
@@ -60,7 +77,7 @@ The author's daily config, showing `-s`/`-n` in practice. The comment next to ea
 
 Run it from your shell, or pass the same flags to `./setup.sh` so the LaunchAgent uses them, e.g. `./setup.sh -c -s "Screen Sharing" -n "Google Chrome"`.
 
-Note: `-s` and `-n` are independent — an app can appear in both lists (like Screen Sharing above), and names are matched case-insensitively, so `-s iTerm2` would also match `iterm2`.
+Note: `-s`, `-n` and `-x` are independent — an app can appear in multiple lists (like Screen Sharing above), and names are matched case-insensitively, so `-s iTerm2` would also match `iterm2`.
 
 ## Building
 
