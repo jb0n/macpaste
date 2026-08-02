@@ -1,5 +1,14 @@
 # MacPaste - The Missing Mouse Paste Feature for Mac OSX
 
+## TL;DR
+
+macpaste brings X11-style middle-click copy/paste to macOS: highlight any text, then middle-click anywhere to paste it. The core utility was written in 2016 by **Remik Ziemlinski** ([rsmz/macpaste](https://github.com/rsmz/macpaste)), public domain, built on the classic CGEventTap + Accessibility techniques. This repo is a maintained fork that has improved it significantly:
+
+- **Click-through (`-t`)** — the first click on a background window now clicks links and buttons instead of only activating the window. No more click-once-to-focus, click-again-to-act.
+- **Per-app controls (`-s`, `-n`, `-x`)** — skip paste handling, skip the focus click, or opt out of click-through for specific apps, matched case-insensitively by app name.
+- **Hardened** — fixed crashes and spurious copies, dropped deprecated APIs, and switched to Accessibility-based window detection so only **Accessibility** permission is needed (no screen recording).
+- **Convenience** — Ctrl instead of Cmd (`-c`), verbose logging (`-v`), and `./setup.sh` installs it as a LaunchAgent that starts at login.
+
 ## Overview
 This simulates the middle mouse button copy/paste found in Unix/Linux X11 window managers.
 
