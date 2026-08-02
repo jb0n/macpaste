@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-macpaste brings X11-style middle-click copy/paste to macOS: highlight any text, then middle-click anywhere to paste it. The core utility was written in 2016 by **Remik Ziemlinski** ([rsmz/macpaste](https://github.com/rsmz/macpaste)), public domain, built on the classic CGEventTap + Accessibility techniques. This repo is a maintained fork that has improved it significantly:
+macpaste brings X11-style middle-click copy/paste to macOS: highlight any text, then middle-click anywhere to paste it. The core utility was written in 2016 by **Remik Ziemlinski** (public domain); the original repo has since disappeared, and the code is preserved at [**lodestone/macpaste**](https://github.com/lodestone/macpaste), which this repo is a fork of. On top of that baseline, this fork adds:
 
 - **Click-through (`-t`)** — the first click on a background window now clicks links and buttons instead of only activating the window. No more click-once-to-focus, click-again-to-act.
 - **Per-app controls (`-s`, `-n`, `-x`)** — skip paste handling, skip the focus click, or opt out of click-through for specific apps, matched case-insensitively by app name.
