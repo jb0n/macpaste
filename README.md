@@ -56,13 +56,13 @@ App names for -s/-n/-x are matched **case-insensitively** against each applicati
 
 ## Example setup (run.sh)
 
-The author's daily config, showing `-s`/`-n` in practice. The comment next to each entry explains why that app is listed:
+The author's daily config, showing `-t`/`-s`/`-n` in practice. The comment next to each entry explains why that app is listed:
 
 ```bash
 #!/usr/bin/env bash
 # -v logs; -c uses Ctrl (not Cmd) as the copy/paste modifier
-# -t click-through: first click on a background window clicks through (links, buttons)
-./macpaste -v -c \
+# -t click-through: the first click on a background window clicks through (links, buttons)
+./macpaste -v -c -t \
     -s "VirtualBox VM"   # guest owns its clipboard; a local Cmd+V would fight the VM's
     -s "Screen Sharing"  # remote Mac handles its own paste; posting Cmd+V would double-fire
     -n "Screen Sharing"  # don't synth-click inside the remote session either
