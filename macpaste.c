@@ -37,20 +37,28 @@
 #define kVK_ANSI_V 0x09
 
 #define DOUBLE_CLICK_MILLIS 500
+#define DOUBLE_CLICK_DISTANCE_PX 10 // two clicks farther apart than this aren't a double-click
 #define DRAG_THRESHOLD_PX 5
 #define PASTE_DELAY_NS 1000000LL // 1 ms, allows click events time to position cursor
 #define MAX_WINDOW_NAME_SIZE 400
 #define CLICK_THROUGH_DELAY_SECONDS 0.1 // wait for app activation before re-posting the click
+// Accessibility calls are synchronous IPC into the target app and several run
+// inside the event tap callback, where blocking stalls the whole input stream.
+// Bound them well below the tap's own timeout so an unresponsive app costs us
+// one failed lookup instead of a frozen cursor.
+#define AX_MESSAGING_TIMEOUT_SECONDS 0.05f
 
-static char gIsDragging = 0;
+static bool gIsDragging = false;
 static long long gPrevClickTime = 0;
 static long long gCurClickTime = 0;
+static CGPoint gPrevClickPoint;
+static CGPoint gCurClickPoint;
 static CGPoint gDragStartPoint;
 
 static CGEventTapLocation gTapA = kCGAnnotatedSessionEventTap;
 static CFMachPortRef gEventTap;
 static AXUIElementRef gSystemWide;
-static CGEventFlags gCommandKey = kCGEventFlagCommand;
+static CGEventFlags gCommandKey = kCGEventFlagMaskCommand;
 static bool gVerbose = false;
 static bool gClickThrough = false;
 static bool gClickThroughExclusions = false;
@@ -58,6 +66,7 @@ static bool gClickThroughPending = false;
 static CGPoint gClickThroughPoint;
 static int gClickThroughClickState = 1;
 static CGEventFlags gClickThroughFlags = 0;
+static pid_t gClickThroughPid = -1;
 
 struct lookup {
     bool skipWindow;
@@ -65,14 +74,14 @@ struct lookup {
     bool noClickThrough;
 };
 
-long long now() {
+static long long now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     long long milliseconds = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000; // calculate milliseconds
     return milliseconds;
 }
 
-static char *lowerDup(const char *s) {
+static char *asciiLowerDup(const char *s) {
     size_t len = strlen(s);
     char *out = malloc(len + 1);
     if (NULL == out) {
@@ -86,21 +95,57 @@ static char *lowerDup(const char *s) {
     return out;
 }
 
+// Case-fold for hash lookups. App display names are UTF-8, so fold via CFString
+// (locale-independent) rather than ASCII-only, otherwise -s/-n/-x silently stay
+// case-sensitive for any non-ASCII character in a name.
+static char *lowerDup(const char *s) {
+    CFStringRef str = CFStringCreateWithCString(kCFAllocatorDefault, s, kCFStringEncodingUTF8);
+    if (NULL == str) {
+        return asciiLowerDup(s); // not valid UTF-8; fold what we can
+    }
+    CFMutableStringRef folded = CFStringCreateMutableCopy(kCFAllocatorDefault, 0, str);
+    CFRelease(str);
+    if (NULL == folded) {
+        return NULL;
+    }
+    CFStringLowercase(folded, NULL);
+    CFIndex bufLen = CFStringGetMaximumSizeForEncoding(CFStringGetLength(folded),
+                                                       kCFStringEncodingUTF8) + 1;
+    char *out = malloc((size_t)bufLen);
+    if (NULL == out) {
+        CFRelease(folded);
+        return NULL;
+    }
+    if (!CFStringGetCString(folded, out, bufLen, kCFStringEncodingUTF8)) {
+        free(out);
+        CFRelease(folded);
+        return NULL;
+    }
+    CFRelease(folded);
+    return out;
+}
+
 static bool copyBasename(const char *path, char *buf, size_t buf_len) {
     const char *base = strrchr(path, '/');
     base = (base != NULL) ? base + 1 : path;
-    snprintf(buf, buf_len, "%s", base);
-    return true;
+    int n = snprintf(buf, buf_len, "%s", base);
+    return n >= 0 && (size_t)n < buf_len; // a truncated name would never match anyway
 }
 
 static bool findBundlePath(const char *execPath, char *out, size_t out_len) {
-    char dir[PATH_MAX];
+    char dir[PROC_PIDPATHINFO_MAXSIZE]; // proc_pidpath() paths can exceed PATH_MAX
+    if (strlen(execPath) >= sizeof(dir)) {
+        return false;
+    }
     snprintf(dir, sizeof(dir), "%s", execPath);
     char *slash = strrchr(dir, '/');
     while (slash != NULL && slash != dir) {
         *slash = '\0';
         size_t len = strlen(dir);
         if (len >= 4 && strcmp(dir + len - 4, ".app") == 0) {
+            if (len >= out_len) {
+                return false; // rather than silently truncate to the wrong bundle
+            }
             snprintf(out, out_len, "%s", dir);
             return true;
         }
@@ -125,7 +170,11 @@ static bool displayNameForExecutable(const char *execPath, char *buf, size_t buf
         CFRelease(url);
     }
     if (bundle != NULL) {
-        CFStringRef display = CFBundleCopyDisplayName(bundle);
+        CFStringRef display = NULL;
+        CFTypeRef displayVal = CFBundleGetValueForInfoDictionaryKey(bundle, CFSTR("CFBundleDisplayName"));
+        if (displayVal != NULL && CFGetTypeID(displayVal) == CFStringGetTypeID()) {
+            display = (CFStringRef)CFRetain(displayVal);
+        }
         if (display == NULL) {
             CFTypeRef nameVal = CFBundleGetValueForInfoDictionaryKey(bundle, kCFBundleNameKey);
             if (nameVal != NULL && CFGetTypeID(nameVal) == CFStringGetTypeID()) {
@@ -180,7 +229,7 @@ static struct lookup *lookupByName(const char *name) {
     if (NULL == key) {
         return NULL;
     }
-    ENTRY e;
+    ENTRY e = {0}; // hsearch() takes ENTRY by value; leave no field uninitialized
     e.key = key;
     ENTRY *ep = hsearch(e, FIND);
     free(key);
@@ -223,7 +272,7 @@ static bool isDockPid(pid_t pid) {
     return strcmp(base, "Dock") == 0;
 }
 
-static pid_t frontmostPid() {
+static pid_t frontmostPid(void) {
     CFTypeRef focused = NULL;
     if (AXUIElementCopyAttributeValue(gSystemWide, kAXFocusedApplicationAttribute,
                                       &focused) != kAXErrorSuccess) {
@@ -275,24 +324,39 @@ struct clickThroughInfo {
     CGPoint point;
     int clickState;
     CGEventFlags flags;
+    pid_t pid;
 };
 
+// Re-post the swallowed click, but only if the world still looks the way it did
+// at mouse-down: the target app must actually be frontmost now, and it must
+// still own whatever is under the click point. Without those checks a dialog
+// that appears during the activation delay, or a window that moved or closed,
+// would receive a click the user never aimed at it.
 static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
     struct clickThroughInfo *ci = (struct clickThroughInfo *)info;
-    postClick(ci->point, ci->clickState, ci->flags);
+    pid_t frontmost = frontmostPid();
+    pid_t under = -1;
+    bool sameTarget = windowInfoAt(&ci->point, NULL, 0, &under) && under == ci->pid;
+    if (frontmost == ci->pid && sameTarget) {
+        postClick(ci->point, ci->clickState, ci->flags);
+    } else if (gVerbose) {
+        printf("click-through: target changed (frontmost %d, under cursor %d, "
+               "expected %d), dropping re-post\n", frontmost, under, ci->pid);
+    }
     free(ci);
     CFRunLoopTimerInvalidate(timer);
     CFRelease(timer);
 }
 
-static void scheduleClickThrough(CGPoint point, int clickState, CGEventFlags flags) {
+static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags flags, pid_t pid) {
     struct clickThroughInfo *ci = malloc(sizeof(*ci));
     if (NULL == ci) {
-        return;
+        return false;
     }
     ci->point = point;
     ci->clickState = clickState;
     ci->flags = flags;
+    ci->pid = pid;
     CFRunLoopTimerContext context;
     context.version = 0;
     context.info = ci;
@@ -307,9 +371,10 @@ static void scheduleClickThrough(CGPoint point, int clickState, CGEventFlags fla
         &context);
     if (NULL == timer) {
         free(ci);
-        return;
+        return false;
     }
     CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    return true;
 }
 
 static void maybeStartClickThrough(CGEventRef event) {
@@ -344,6 +409,7 @@ static void maybeStartClickThrough(CGEventRef event) {
     gClickThroughPoint = point;
     gClickThroughClickState = clickState;
     gClickThroughFlags = CGEventGetFlags(event);
+    gClickThroughPid = pid;
     gClickThroughPending = true;
 }
 
@@ -413,17 +479,28 @@ static void copy(CGEventRef event) {
     postKeyDownUp(kVK_ANSI_C, gCommandKey);
 }
 
-static void recordClickTime() {
+static void recordClick(CGPoint point) {
     gPrevClickTime = gCurClickTime;
     gCurClickTime = now();
+    gPrevClickPoint = gCurClickPoint;
+    gCurClickPoint = point;
 }
 
-static char isDoubleClickSpeed() {
+static bool isDoubleClickSpeed(void) {
     return (gCurClickTime - gPrevClickTime) < DOUBLE_CLICK_MILLIS;
 }
 
-static char isDoubleClick() {
-    return isDoubleClickSpeed();
+static bool isDoubleClickDistance(void) {
+    double dx = gCurClickPoint.x - gPrevClickPoint.x;
+    double dy = gCurClickPoint.y - gPrevClickPoint.y;
+    return (dx * dx + dy * dy) <=
+           (double)DOUBLE_CLICK_DISTANCE_PX * DOUBLE_CLICK_DISTANCE_PX;
+}
+
+// Both tests matter: time alone treats two unrelated clicks at opposite corners
+// of the screen as a double-click and fires a copy, overwriting the clipboard.
+static bool isDoubleClick(void) {
+    return isDoubleClickSpeed() && isDoubleClickDistance();
 }
 
 static CGEventRef mouseCallback (
@@ -442,8 +519,8 @@ static CGEventRef mouseCallback (
         break;
 
     case kCGEventLeftMouseDown:
-        recordClickTime();
         gDragStartPoint = CGEventGetLocation(event);
+        recordClick(gDragStartPoint);
         if (gClickThrough) {
             gClickThroughPending = false; // stale pending from a lost up; start fresh
             maybeStartClickThrough(event);
@@ -457,19 +534,24 @@ static CGEventRef mouseCallback (
                 if (gVerbose) {
                     printf("click-through: swallowing click, re-posting\n");
                 }
-                scheduleClickThrough(gClickThroughPoint, gClickThroughClickState,
-                                     gClickThroughFlags);
-                gIsDragging = 0;
-                return NULL;
-            }
-            if (gVerbose) {
+                if (scheduleClickThrough(gClickThroughPoint, gClickThroughClickState,
+                                         gClickThroughFlags, gClickThroughPid)) {
+                    gIsDragging = false;
+                    return NULL;
+                }
+                // Couldn't schedule the re-post, so don't swallow the up: passing
+                // it through beats silently losing the user's click.
+                if (gVerbose) {
+                    printf("click-through: couldn't schedule re-post, passing click through\n");
+                }
+            } else if (gVerbose) {
                 printf("click-through: click became a drag, passing through\n");
             }
         }
         if (isDoubleClick() || gIsDragging) {
             copy(event);
         }
-        gIsDragging = 0;
+        gIsDragging = false;
         break;
 
     case kCGEventLeftMouseDragged:
@@ -479,7 +561,7 @@ static CGEventRef mouseCallback (
                 gDragStartPoint.x - p.x > DRAG_THRESHOLD_PX ||
                 p.y - gDragStartPoint.y > DRAG_THRESHOLD_PX ||
                 gDragStartPoint.y - p.y > DRAG_THRESHOLD_PX) {
-                gIsDragging = 1;
+                gIsDragging = true;
             }
         }
         break;
@@ -507,7 +589,7 @@ static bool addLookupEntry(const char *name, bool skipWindow, bool noFocus, bool
         printf("Couldn't allocate lookup key\n");
         return false;
     }
-    ENTRY e;
+    ENTRY e = {0}; // hsearch() takes ENTRY by value; leave no field uninitialized
     e.key = key;
     ENTRY *ep = hsearch(e, FIND);
     if (NULL == ep) {
@@ -533,8 +615,25 @@ static bool addLookupEntry(const char *name, bool skipWindow, bool noFocus, bool
         le->skipWindow |= skipWindow;
         le->noFocus |= noFocus;
         le->noClickThrough |= noClickThrough;
+        free(key); // only ENTER hands the key to the table (hdestroy() frees those)
     }
     return true;
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s [-v] [-c] [-t] [-n name] [-s name] [-x name]\n"
+            "  -v         verbose logging\n"
+            "  -c         use ctrl instead of cmd for the synthesized copy/paste\n"
+            "  -t         enable click-through: the first click on a background\n"
+            "             window is re-posted after its app is activated\n"
+            "  -n name    don't focus (click) windows of this app before pasting\n"
+            "  -s name    skip this app entirely (no copy, no paste)\n"
+            "  -x name    exclude this app from click-through (requires -t)\n"
+            "  -h         show this help\n"
+            "Names match the app's display name, case-insensitively.\n"
+            "Terminate with Ctrl+C.\n",
+            prog);
 }
 
 int main (int argc, char **argv) {
@@ -542,54 +641,62 @@ int main (int argc, char **argv) {
     CFMachPortRef myEventTap;
     CFRunLoopSourceRef eventTapRLSrc;
 
+    // Line-buffer stdout: it is block-buffered when piped, so -v output would
+    // otherwise not appear until the buffer fills (this runs until Ctrl+C).
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     // Always create the lookup table: windowLookup() runs on every paste/copy
     // even with no args, and hsearch() on an uncreated table is a crash.
     if (0 == hcreate((size_t)argc + 10)) {
-        printf("Couldn't create hash table\n");
-        return -1;
+        fprintf(stderr, "Couldn't create hash table\n");
+        return 1;
     }
 
-    if (argc > 1) {
-        int opt;
-        while ((opt = getopt(argc, argv, "vctn:s:x:")) != -1) {
-            switch (opt) {
-            case 'v':
-                gVerbose = true;
-                break;
-            case 'c':
-                gCommandKey = kCGEventFlagControl;
-                printf("Using ctrl instead of cmd\n");
-                break;
-            case 't':
-                gClickThrough = true;
-                printf("Click-through enabled: first click on a background window also clicks through\n");
-                break;
-            case 'n':
-                printf("Won't focus window '%s'\n", optarg);
-                if (!addLookupEntry(optarg, false, true, false)) {
-                    return -1;
-                }
-                break;
-            case 's':
-                printf("Will skip window '%s'\n", optarg);
-                if (!addLookupEntry(optarg, true, false, false)) {
-                    return -1;
-                }
-                break;
-            case 'x':
-                printf("Won't click through window '%s'\n", optarg);
-                if (!addLookupEntry(optarg, false, false, true)) {
-                    return -1;
-                }
-                gClickThroughExclusions = true;
-                break;
-            default:
-                break;
+    int opt;
+    while ((opt = getopt(argc, argv, "hvctn:s:x:")) != -1) {
+        switch (opt) {
+        case 'v':
+            gVerbose = true;
+            break;
+        case 'c':
+            gCommandKey = kCGEventFlagMaskControl;
+            printf("Using ctrl instead of cmd\n");
+            break;
+        case 't':
+            gClickThrough = true;
+            printf("Click-through enabled: first click on a background window also clicks through\n");
+            break;
+        case 'n':
+            printf("Won't focus window '%s'\n", optarg);
+            if (!addLookupEntry(optarg, false, true, false)) {
+                return 1;
             }
+            break;
+        case 's':
+            printf("Will skip window '%s'\n", optarg);
+            if (!addLookupEntry(optarg, true, false, false)) {
+                return 1;
+            }
+            break;
+        case 'x':
+            printf("Won't click through window '%s'\n", optarg);
+            if (!addLookupEntry(optarg, false, false, true)) {
+                return 1;
+            }
+            gClickThroughExclusions = true;
+            break;
+        case 'h':
+            usage(argv[0]);
+            return 0;
+        default:
+            // Unknown option or missing argument: don't run on a half-applied config.
+            usage(argv[0]);
+            return 1;
         }
-        if (gVerbose && !gClickThrough && gClickThroughExclusions) {
-            printf("-x given but click-through is off (-t); exclusions have no effect\n");
-        }
+    }
+    if (!gClickThrough && gClickThroughExclusions) {
+        fprintf(stderr, "Warning: -x given but click-through is off (-t); "
+                        "exclusions have no effect\n");
     }
 
     gSystemWide = AXUIElementCreateSystemWide();
@@ -597,6 +704,7 @@ int main (int argc, char **argv) {
         fprintf(stderr, "Failed to create system-wide AX element\n");
         return 1;
     }
+    AXUIElementSetMessagingTimeout(gSystemWide, AX_MESSAGING_TIMEOUT_SECONDS);
 
     printf("Quit from command-line foreground with Ctrl+C\n");
 
@@ -635,6 +743,10 @@ int main (int argc, char **argv) {
                         myEventTap,
                         0
                     );
+    if (NULL == eventTapRLSrc) {
+        fprintf(stderr, "Failed to create run loop source for event tap\n");
+        return 1;
+    }
 
     // Add the source to the current RunLoop
     CFRunLoopAddSource(
@@ -642,6 +754,7 @@ int main (int argc, char **argv) {
         eventTapRLSrc,
         kCFRunLoopDefaultMode
     );
+    CFRelease(eventTapRLSrc); // the run loop retains it; gEventTap keeps the tap alive
 
     // Keep the RunLoop running forever
     CFRunLoopRun();

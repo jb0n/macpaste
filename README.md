@@ -37,6 +37,7 @@ Notes:
 - Apps with their own click-through (Terminal, iTerm2) still receive exactly one completed click.
 - Double-clicking text in a background window may select a word on the first click instead of just placing the cursor.
 - `-x "App Name"` opts an app out of click-through entirely, e.g. `./macpaste -t -x "Google Chrome"`.
+- Before re-posting, macpaste re-checks that the target app is actually frontmost and still owns whatever is under the cursor. If a dialog appeared, or the window moved or closed during the delay, the re-post is dropped rather than sent to whatever happens to be there now (`-v` logs when this happens).
 
 ## Permissions
 macpaste needs **Accessibility** permission only (System Settings > Privacy & Security > Accessibility). This is the same permission the event tap already requires. **Screen Recording permission is not needed** - window detection uses the Accessibility API (AXUIElement), not screen capture.
@@ -60,6 +61,8 @@ To install as a LaunchAgent that starts at login and restarts automatically, run
 -n "App Name" Don't focus window before pasting by simulating left click. This was the default behavior, but causes browsers to do weird things trying to open tabs by middle clicking.
 
 -v Verbose mode. Logs some extra info.
+
+-h Prints usage and exits. An unknown option or a missing option argument also prints usage and exits non-zero rather than starting up with a partly applied config.
 
 App names for -s/-n/-x are matched **case-insensitively** against each application's display name (resolved from its bundle Info.plist, e.g. "VirtualBox VM" matches the VM window). If an app exposes no Accessibility elements, it simply isn't matched and pasting proceeds normally.
 
