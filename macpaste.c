@@ -41,12 +41,19 @@
 #define DRAG_THRESHOLD_PX 5
 #define PASTE_DELAY_NS 1000000LL // 1 ms, allows click events time to position cursor
 #define MAX_WINDOW_NAME_SIZE 400
-#define CLICK_THROUGH_DELAY_SECONDS 0.1 // wait for app activation before re-posting the click
+#define CLICK_THROUGH_DELAY_SECONDS 0.1 // first check for app activation
+// Activation latency varies with how busy the target app is, so poll for it
+// instead of assuming it has completed by a fixed deadline: a single check at
+// CLICK_THROUGH_DELAY_SECONDS drops the re-post whenever activation runs long.
+#define CLICK_THROUGH_POLL_SECONDS 0.025
+#define CLICK_THROUGH_MAX_ATTEMPTS 16 // ~0.5s total before giving up
 // Accessibility calls are synchronous IPC into the target app and several run
 // inside the event tap callback, where blocking stalls the whole input stream.
-// Bound them well below the tap's own timeout so an unresponsive app costs us
-// one failed lookup instead of a frozen cursor.
-#define AX_MESSAGING_TIMEOUT_SECONDS 0.05f
+// Bound them below the tap's own disable-by-timeout so an unresponsive app costs
+// one failed lookup instead of a frozen cursor. Measured cold worst case for
+// AXUIElementCopyElementAtPosition on this machine was ~52ms, so keep healthy
+// margin over that; too tight a value silently disables window matching.
+#define AX_MESSAGING_TIMEOUT_SECONDS 0.25f
 
 static bool gIsDragging = false;
 static long long gPrevClickTime = 0;
@@ -272,20 +279,6 @@ static bool isDockPid(pid_t pid) {
     return strcmp(base, "Dock") == 0;
 }
 
-static pid_t frontmostPid(void) {
-    CFTypeRef focused = NULL;
-    if (AXUIElementCopyAttributeValue(gSystemWide, kAXFocusedApplicationAttribute,
-                                      &focused) != kAXErrorSuccess) {
-        return -1;
-    }
-    pid_t pid = -1;
-    if (focused != NULL) {
-        AXUIElementGetPid((AXUIElementRef)focused, &pid);
-        CFRelease(focused);
-    }
-    return pid;
-}
-
 static void activateApp(pid_t pid) {
     AXUIElementRef app = AXUIElementCreateApplication(pid);
     if (NULL == app) {
@@ -325,27 +318,71 @@ struct clickThroughInfo {
     int clickState;
     CGEventFlags flags;
     pid_t pid;
+    int attemptsLeft;
 };
 
-// Re-post the swallowed click, but only if the world still looks the way it did
-// at mouse-down: the target app must actually be frontmost now, and it must
-// still own whatever is under the click point. Without those checks a dialog
-// that appears during the activation delay, or a window that moved or closed,
-// would receive a click the user never aimed at it.
-static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
-    struct clickThroughInfo *ci = (struct clickThroughInfo *)info;
-    pid_t frontmost = frontmostPid();
-    pid_t under = -1;
-    bool sameTarget = windowInfoAt(&ci->point, NULL, 0, &under) && under == ci->pid;
-    if (frontmost == ci->pid && sameTarget) {
-        postClick(ci->point, ci->clickState, ci->flags);
-    } else if (gVerbose) {
-        printf("click-through: target changed (frontmost %d, under cursor %d, "
-               "expected %d), dropping re-post\n", frontmost, under, ci->pid);
+// Ask an app directly whether it is frontmost, reading back the same attribute
+// activateApp() sets. This replaces querying kAXFocusedApplicationAttribute on
+// the system-wide element, which fails with kAXErrorCannotComplete whenever the
+// current frontmost app declines to answer it (VMware Fusion, for one) and so
+// silently disabled click-through for as long as such an app was in front.
+//
+// Returns false if the app does not answer at all, which is NOT the same as
+// answering "not frontmost": callers must never swallow a click for an app whose
+// state they cannot read, or the click would be lost entirely.
+static bool readAppFrontmost(pid_t pid, bool *frontmost) {
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (NULL == app) {
+        return false;
     }
+    bool ok = false;
+    CFTypeRef val = NULL;
+    if (AXUIElementCopyAttributeValue(app, kAXFrontmostAttribute, &val) == kAXErrorSuccess &&
+        val != NULL) {
+        if (CFGetTypeID(val) == CFBooleanGetTypeID()) {
+            *frontmost = CFBooleanGetValue((CFBooleanRef)val);
+            ok = true;
+        }
+        CFRelease(val);
+    }
+    CFRelease(app);
+    return ok;
+}
+
+static void endClickThrough(CFRunLoopTimerRef timer, struct clickThroughInfo *ci) {
     free(ci);
     CFRunLoopTimerInvalidate(timer);
     CFRelease(timer);
+}
+
+// Re-post the swallowed click once the target app is actually frontmost, and
+// only if it still owns whatever is under the click point. Without the ownership
+// check a dialog that appeared while we waited, or a window that moved or closed,
+// would receive a click the user never aimed at it. This runs on the run loop
+// rather than in the tap callback, so these AX calls cannot stall input.
+static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
+    struct clickThroughInfo *ci = (struct clickThroughInfo *)info;
+
+    bool frontmost = false;
+    if (!readAppFrontmost(ci->pid, &frontmost) || !frontmost) {
+        if (--ci->attemptsLeft > 0) {
+            return; // activation still in flight; the repeating timer retries
+        }
+        if (gVerbose) {
+            printf("click-through: pid %d never became frontmost, dropping re-post\n", ci->pid);
+        }
+        endClickThrough(timer, ci);
+        return;
+    }
+
+    pid_t under = -1;
+    if (windowInfoAt(&ci->point, NULL, 0, &under) && under == ci->pid) {
+        postClick(ci->point, ci->clickState, ci->flags);
+    } else if (gVerbose) {
+        printf("click-through: pid %d no longer owns the click point (now %d), "
+               "dropping re-post\n", ci->pid, under);
+    }
+    endClickThrough(timer, ci);
 }
 
 static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags flags, pid_t pid) {
@@ -357,16 +394,19 @@ static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags fla
     ci->clickState = clickState;
     ci->flags = flags;
     ci->pid = pid;
+    ci->attemptsLeft = CLICK_THROUGH_MAX_ATTEMPTS;
     CFRunLoopTimerContext context;
     context.version = 0;
     context.info = ci;
     context.retain = NULL;
     context.release = NULL;
     context.copyDescription = NULL;
+    // Repeating: the callback polls for activation and stops the timer itself,
+    // either after re-posting the click or once it runs out of attempts.
     CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
         kCFAllocatorDefault,
         CFAbsoluteTimeGetCurrent() + CLICK_THROUGH_DELAY_SECONDS,
-        0, 0, 0,
+        CLICK_THROUGH_POLL_SECONDS, 0, 0,
         clickThroughTimerCallback,
         &context);
     if (NULL == timer) {
@@ -387,8 +427,20 @@ static void maybeStartClickThrough(CGEventRef event) {
     if (isDockPid(pid)) {
         return;
     }
-    pid_t frontmost = frontmostPid();
-    if (frontmost <= 0 || frontmost == pid) {
+    bool frontmost = false;
+    if (!readAppFrontmost(pid, &frontmost)) {
+        // Can't tell, so don't swallow the up: passing the click through beats
+        // holding one back for an app that may never report itself frontmost.
+        if (gVerbose) {
+            printf("click-through: can't read frontmost state of %s, passing click through\n",
+                   name);
+        }
+        return;
+    }
+    if (frontmost) {
+        if (gVerbose) {
+            printf("click-through: %s already frontmost\n", name);
+        }
         return;
     }
     struct lookup *le = lookupByName(name);

@@ -37,7 +37,8 @@ Notes:
 - Apps with their own click-through (Terminal, iTerm2) still receive exactly one completed click.
 - Double-clicking text in a background window may select a word on the first click instead of just placing the cursor.
 - `-x "App Name"` opts an app out of click-through entirely, e.g. `./macpaste -t -x "Google Chrome"`.
-- Before re-posting, macpaste re-checks that the target app is actually frontmost and still owns whatever is under the cursor. If a dialog appeared, or the window moved or closed during the delay, the re-post is dropped rather than sent to whatever happens to be there now (`-v` logs when this happens).
+- macpaste waits for the app to actually become frontmost (polling up to ~0.5s) and re-checks that it still owns whatever is under the cursor before re-posting. If a dialog appeared, or the window moved or closed while waiting, the re-post is dropped rather than sent to whatever happens to be there now (`-v` logs when this happens).
+- Whether an app is frontmost is read from that app directly. An app that doesn't report its frontmost state gets no click-through, and its clicks are passed through untouched rather than held back.
 
 ## Permissions
 macpaste needs **Accessibility** permission only (System Settings > Privacy & Security > Accessibility). This is the same permission the event tap already requires. **Screen Recording permission is not needed** - window detection uses the Accessibility API (AXUIElement), not screen capture.
