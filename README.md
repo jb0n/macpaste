@@ -68,7 +68,9 @@ If Accessibility permission is denied, macpaste prints a clear message and exits
 ## Usage
 Run the executable in the background from your shell command-line interface, or run it as a "Login Item" at startup (System Preferences > Users & Groups > Login Items > + > Navigate to file).
 
-To install as a LaunchAgent that starts at login and restarts automatically, run `./setup.sh`. Pass any extra arguments you want the agent to use, e.g. `./setup.sh -c -s "Screen Sharing"`.
+To install as a LaunchAgent that starts at login and restarts automatically, run `./setup.sh`. Pass any extra arguments you want the agent to use, e.g. `./setup.sh -t -s "Screen Sharing" -n "Screen Sharing"`. It builds macpaste, copies it to `~/bin/macpaste`, writes the plist, and prints the `launchctl bootstrap` line to start it. Agent output, including `-v` logging, goes to `~/Library/Logs/macpaste.log`.
+
+Re-running `setup.sh` stops an already-loaded agent first, since it would otherwise keep running the previous binary and arguments. Note that it also replaces `~/bin/macpaste`: Accessibility permission follows the binary, so an entry approved for an earlier build may have to be removed and re-added before the agent will start.
 
 ## Options
 -s "App Name" to skip the handling of that application
