@@ -6,6 +6,7 @@ macpaste brings X11-style middle-click copy/paste to macOS: highlight any text, 
 
 - **Click-through (`-t`)** — the first click on a background window now clicks links and buttons instead of only activating the window. No more click-once-to-focus, click-again-to-act.
 - **Per-app controls (`-s`, `-n`, `-x`)** — skip paste handling, skip the focus click, or opt out of click-through for specific apps, matched case-insensitively by app name.
+- **Works with VMs and remote desktops** — the copy/paste modifier is sent as a real key press rather than only a flag on the key event, so clients that track modifier state the way hardware reports it see Cmd+C instead of a literal `c`. Guest windows can also be skipped outright, which is usually what you want.
 - **Hardened** — fixed crashes and spurious copies, dropped deprecated APIs, and switched to Accessibility-based window detection so only **Accessibility** permission is needed (no screen recording).
 - **Convenience** — Ctrl instead of Cmd (`-c`), verbose logging (`-v`), and `./setup.sh` installs it as a LaunchAgent that starts at login.
 
@@ -20,7 +21,11 @@ This program assumes that the key combinations Cmd+C/Cmd+V are mapped as copy an
 1. Cmd+C down & up (copies your selected text or objects) whenever your left mouse button releases after a drag of more than 5 pixels or after a double-click.
    This allows copying text that is drag highlighted, or double-clicked to highlight words or lines.
 2. Left Mouse Button down & up (position mouse cursor for paste insertion) on middle click.
-3. Cmd+V down & up after tiny delay following middle click.
+3. Cmd+V down & up, 15 ms after that click, giving the app time to move its caret first.
+
+The modifier is sent as a real key press and release around the keystroke, not merely as a flag set on the key event. Native Mac apps accept either, but VM and remote-desktop clients rebuild modifier state from the modifier events real hardware emits; without them the guest receives a bare `c` or `v` and types the letter instead of copying or pasting. See [Virtual machines and remote desktops](#virtual-machines-and-remote-desktops) — those windows usually want to be skipped entirely anyway.
+
+Synthetic mouse events are posted at the session event tap, which is the only tap location that actually delivers them to applications, and are tagged so macpaste ignores its own clicks when they arrive back through its tap.
 
 Only the middle mouse button (button 2) pastes; side/back buttons (button 3+) do nothing. Micro-drags of less than 5 pixels do not trigger a copy.
 
@@ -28,17 +33,32 @@ If your mouse is left-handed, or you remapped the keystrokes, then just edit the
 
 #### Optional: Click-through (-t)
 
-Normally macOS swallows the first click on a background window: the window activates, but the click never reaches the content (links, buttons), so you must click a second time. With `-t`, macpaste watches for left clicks on windows of non-frontmost apps, activates the app, and re-posts the click about 100 ms later, so the first click also acts on the content.
+Normally macOS swallows the first click on a background window: the window activates, but the click never reaches the content (links, buttons), so you must click a second time. With `-t`, macpaste watches for left clicks on windows of non-frontmost apps, activates the app, and replays the click about 100 ms later, so the first click also acts on the content.
 
 Notes:
 
-- Drags are passed through untouched (a press-and-drag on a background window behaves as usual).
+- Both halves of the click are held back and replayed together. Releasing one without the other would leave the app running the tracking loop it starts on mouse-down, so it would read every later mouse move as a drag and select text as the pointer travelled.
+- If the click turns into a drag (more than 5 pixels), the held-back press is released immediately at the point you pressed and the rest of the drag runs normally, so drags are not swallowed while macpaste waits for activation.
+- Because the press is deferred, press-and-hold on a *background* window does nothing until you release it or start dragging. Ordinary clicking is unaffected.
 - Clicks on the Dock and menu bar are never re-posted.
 - Apps with their own click-through (Terminal, iTerm2) still receive exactly one completed click.
 - Double-clicking text in a background window may select a word on the first click instead of just placing the cursor.
 - `-x "App Name"` opts an app out of click-through entirely, e.g. `./macpaste -t -x "Google Chrome"`.
-- macpaste waits for the app to actually become frontmost (polling up to ~0.5s) and re-checks that it still owns whatever is under the cursor before re-posting. If a dialog appeared, or the window moved or closed while waiting, the re-post is dropped rather than sent to whatever happens to be there now (`-v` logs when this happens).
+- macpaste waits for the app to actually become frontmost (polling up to ~0.5s), then re-checks that it still owns whatever is under the cursor. If a dialog appeared, or the window moved or closed while waiting, the click is dropped rather than sent to whatever happens to be there now (`-v` logs this). If the app simply never reports itself frontmost, the click is replayed anyway rather than lost — that is just the ordinary activate-on-first-click behaviour.
 - Whether an app is frontmost is read from that app directly. An app that doesn't report its frontmost state gets no click-through, and its clicks are passed through untouched rather than held back.
+
+## Virtual machines and remote desktops
+
+Give VM and remote-desktop windows **both `-s` and `-n`**:
+
+    ./macpaste -t -s "VMware Fusion" -n "VMware Fusion"
+
+The guest already does its own copy-on-select and middle-click paste, so macpaste only has to stay out of the way. `-s` alone is not enough, for two separate reasons:
+
+- `-s` stops the copy and paste keystrokes, but the focus click is posted *before* the skip check, so a skipped app still receives a stray left click. Inside a guest that click collapses the very selection you were about to paste. `-n` suppresses it.
+- The synthesized Cmd arrives in a Linux guest as **Super**, so a middle click fires Super+V at the desktop environment rather than pasting. `-s` stops that.
+
+The names carried in the shipped `run.sh` are `VMware Fusion`, `VirtualBox VM`, `UTM`, `Screen Sharing` and `Royal TSX`. For any other app — or if one of those stops matching — run with `-v` and click the window: macpaste logs the name it resolved, and that is the string to pass.
 
 ## Permissions
 macpaste needs **Accessibility** permission only (System Settings > Privacy & Security > Accessibility). This is the same permission the event tap already requires. **Screen Recording permission is not needed** - window detection uses the Accessibility API (AXUIElement), not screen capture.
@@ -69,26 +89,44 @@ App names for -s/-n/-x are matched **case-insensitively** against each applicati
 
 ## Example setup (run.sh)
 
-The author's daily config, showing `-t`/`-s`/`-n` in practice. The comment next to each entry explains why that app is listed:
+The author's daily config, showing `-t`/`-s`/`-n` in practice:
 
 ```bash
 #!/usr/bin/env bash
-# -v logs; -c uses Ctrl (not Cmd) as the copy/paste modifier
-# -t click-through: the first click on a background window clicks through (links, buttons)
-./macpaste -v -c -t \
-    -s "VirtualBox VM"   # guest owns its clipboard; a local Cmd+V would fight the VM's
-    -s "Screen Sharing"  # remote Mac handles its own paste; posting Cmd+V would double-fire
-    -n "Screen Sharing"  # don't synth-click inside the remote session either
-    -n "Google Chrome"   # synthetic left click can open tabs / mess with links on middle click
-    -n "Slack"           # synth click can drop focus out of the composer or switch channels
-    -s uTorrent          # nothing to paste into the torrent list
-    -s iTerm2            # already pastes on middle click itself; would double-paste
-    -s Terminal          # same reason as iTerm2
-    -s Finder            # no text target; paste would beep or trigger rename oddness
-    -s "Royal TSX"       # RDP/SSH client: remote side handles paste, like Screen Sharing
+# -v logs; -t click-through: the first click on a background window also
+# clicks through to the content (links, buttons)
+#
+# The first five take both -s and -n: they are VM or remote-desktop windows
+# whose guest handles copy/paste itself. See "Virtual machines and remote
+# desktops" above for why -s alone leaves a stray click behind.
+#
+# Google Chrome, Slack   -n only: a synthetic left click can open a tab, or
+#                        drop focus out of the composer.
+# iTerm2, Terminal       -s: they already paste on middle click, so macpaste
+#                        would paste a second time.
+# Finder, uTorrent       -s: no text target to paste into.
+./macpaste -v -t \
+    -s "VMware Fusion" \
+    -n "VMware Fusion" \
+    -s "VirtualBox VM" \
+    -n "VirtualBox VM" \
+    -s "UTM" \
+    -n "UTM" \
+    -s "Screen Sharing" \
+    -n "Screen Sharing" \
+    -s "Royal TSX" \
+    -n "Royal TSX" \
+    -n "Google Chrome" \
+    -n "Slack" \
+    -s uTorrent \
+    -s iTerm2 \
+    -s Terminal \
+    -s Finder
 ```
 
-Run it from your shell, or pass the same flags to `./setup.sh` so the LaunchAgent uses them, e.g. `./setup.sh -c -s "Screen Sharing" -n "Google Chrome"`.
+Note that `-c` is absent: Cmd is what native Mac apps expect, and the VM windows that would want Ctrl are skipped outright. `-c` is global, so there is no way to use Ctrl for a guest and Cmd for Slack in a single instance.
+
+Run it from your shell, or pass the same flags to `./setup.sh` so the LaunchAgent uses them, e.g. `./setup.sh -t -s "Screen Sharing" -n "Google Chrome"`.
 
 Note: `-s`, `-n` and `-x` are independent — an app can appear in multiple lists (like Screen Sharing above), and names are matched case-insensitively, so `-s iTerm2` would also match `iterm2`.
 
