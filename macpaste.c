@@ -35,11 +35,14 @@
 
 #define kVK_ANSI_C 0x08
 #define kVK_ANSI_V 0x09
+#define kVK_Command 0x37
+#define kVK_Control 0x3B
 
 #define DOUBLE_CLICK_MILLIS 500
 #define DOUBLE_CLICK_DISTANCE_PX 10 // two clicks farther apart than this aren't a double-click
 #define DRAG_THRESHOLD_PX 5
 #define PASTE_DELAY_NS 1000000LL // 1 ms, allows click events time to position cursor
+#define MODIFIER_DELAY_NS 1000000LL // 1 ms, lets the modifier register before the key
 #define MAX_WINDOW_NAME_SIZE 400
 #define CLICK_THROUGH_DELAY_SECONDS 0.1 // first check for app activation
 // Activation latency varies with how busy the target app is, so poll for it
@@ -465,6 +468,43 @@ static void maybeStartClickThrough(CGEventRef event) {
     gClickThroughPending = true;
 }
 
+static void nsleep(long long nanos) {
+    struct timespec delay;
+    delay.tv_sec = 0;
+    delay.tv_nsec = nanos;
+    nanosleep(&delay, NULL);
+}
+
+// The virtual keycode of the physical modifier key that produces `flags`, so we
+// can press and release it as hardware would.
+static CGKeyCode modifierKeyCode(CGEventFlags flags) {
+    return (flags & kCGEventFlagMaskControl) ? kVK_Control : kVK_Command;
+}
+
+// Press or release the modifier key itself. Given a modifier keycode,
+// CGEventCreateKeyboardEvent() returns a flagsChanged event already carrying the
+// modifier mask plus the device-dependent left/right bit that real hardware sets
+// (0x...108 for left command down, cleared on release), so take those flags as
+// given and only add `extra`. Returns the posted flags so the key event between
+// the two can carry the same state.
+static CGEventFlags postModifier(CGKeyCode keycode, bool down, CGEventFlags extra) {
+    CGEventRef event = CGEventCreateKeyboardEvent(NULL, keycode, down);
+    if (NULL == event) {
+        return extra;
+    }
+    CGEventFlags flags = CGEventGetFlags(event) | extra;
+    CGEventSetFlags(event, flags);
+    CGEventPost(gTapA, event);
+    CFRelease(event);
+    return flags;
+}
+
+// Bracket the keystroke with real modifier press/release events instead of only
+// stamping the flags onto the key event. Native Cocoa apps read the flags field
+// and so accept the bare key event, but VM and remote-desktop clients (VMware
+// Fusion, VirtualBox, RDP/VNC) track modifier state from flagsChanged and ignore
+// that field, so without this the guest receives a plain "c"/"v" keypress and
+// types the letter instead of copying or pasting.
 static void postKeyDownUp(CGKeyCode keycode, CGEventFlags flags) {
     CGEventRef kbdEventDown = CGEventCreateKeyboardEvent(NULL, keycode, 1);
     CGEventRef kbdEventUp   = CGEventCreateKeyboardEvent(NULL, keycode, 0);
@@ -477,10 +517,26 @@ static void postKeyDownUp(CGKeyCode keycode, CGEventFlags flags) {
         }
         return;
     }
-    CGEventSetFlags(kbdEventDown, flags);
-    CGEventSetFlags(kbdEventUp, flags);
+    // Whatever the user is physically holding right now. It is deliberately kept
+    // out of the keystroke itself: shift+drag to extend a selection and alt+drag
+    // for column selection are ordinary gestures, and folding those in would send
+    // cmd+shift+c or cmd+alt+c, which mean something else entirely. It goes only
+    // on the release, so we hand their real modifier state back afterwards
+    // instead of leaving the system believing they let go.
+    CGEventFlags held = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) &
+                        (kCGEventFlagMaskCommand | kCGEventFlagMaskControl |
+                         kCGEventFlagMaskAlternate | kCGEventFlagMaskShift);
+    CGKeyCode modKey = modifierKeyCode(flags);
+
+    CGEventFlags down = postModifier(modKey, true, 0);
+    nsleep(MODIFIER_DELAY_NS);
+    CGEventSetFlags(kbdEventDown, down);
+    CGEventSetFlags(kbdEventUp, down);
     CGEventPost(gTapA, kbdEventDown);
     CGEventPost(gTapA, kbdEventUp);
+    nsleep(MODIFIER_DELAY_NS);
+    postModifier(modKey, false, held & ~flags);
+
     CFRelease(kbdEventDown);
     CFRelease(kbdEventUp);
 }
@@ -514,10 +570,7 @@ static void paste(CGEventRef event) {
     }
 
     // Allow click events time to position cursor before pasting.
-    struct timespec delay;
-    delay.tv_sec = 0;
-    delay.tv_nsec = PASTE_DELAY_NS;
-    nanosleep(&delay, NULL);
+    nsleep(PASTE_DELAY_NS);
 
     // Paste.
     postKeyDownUp(kVK_ANSI_V, gCommandKey);
