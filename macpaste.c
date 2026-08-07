@@ -41,7 +41,14 @@
 #define DOUBLE_CLICK_MILLIS 500
 #define DOUBLE_CLICK_DISTANCE_PX 10 // two clicks farther apart than this aren't a double-click
 #define DRAG_THRESHOLD_PX 5
-#define PASTE_DELAY_NS 1000000LL // 1 ms, allows click events time to position cursor
+// Time for the focus click to land before the paste keystroke follows it. This
+// used to be 1 ms, which was never actually exercised: the click was posted to
+// the annotated tap and no application ever received it. Now that it is
+// delivered, the target has to process it and move its caret first, which is a
+// round trip to another process -- paste ahead of that and the text lands where
+// the caret used to be. Blocking the tap callback this long is fine; it costs
+// one middle click and stays far below the tap's own disable-by-timeout.
+#define PASTE_DELAY_NS 15000000LL // 15 ms
 #define MODIFIER_DELAY_NS 1000000LL // 1 ms, lets the modifier register before the key
 #define MAX_WINDOW_NAME_SIZE 400
 #define CLICK_THROUGH_DELAY_SECONDS 0.1 // first check for app activation
@@ -57,6 +64,11 @@
 // AXUIElementCopyElementAtPosition on this machine was ~52ms, so keep healthy
 // margin over that; too tight a value silently disables window matching.
 #define AX_MESSAGING_TIMEOUT_SECONDS 0.25f
+// Stamped on every mouse event we post. The session tap is upstream of our own
+// tap, so these come straight back to mouseCallback; unmarked, a re-posted click
+// would look like a fresh user click and start a second click-through, or land
+// close enough in time to count as a double-click and fire a spurious copy.
+#define MACPASTE_SYNTHETIC 0x6D6370737465LL // "mcpste"
 
 static bool gIsDragging = false;
 static long long gPrevClickTime = 0;
@@ -65,7 +77,13 @@ static CGPoint gPrevClickPoint;
 static CGPoint gCurClickPoint;
 static CGPoint gDragStartPoint;
 
+// Keyboard posts go to the annotated tap, which routes them to the focused app.
 static CGEventTapLocation gTapA = kCGAnnotatedSessionEventTap;
+// Mouse posts must not. Measured on this machine: a click posted to the
+// annotated tap is never delivered to any application, frontmost or not, while
+// the same click posted to the session tap always is. Everything synthetic we
+// aim at a window therefore goes here.
+static CGEventTapLocation gTapMouse = kCGSessionEventTap;
 static CFMachPortRef gEventTap;
 static AXUIElementRef gSystemWide;
 static CGEventFlags gCommandKey = kCGEventFlagMaskCommand;
@@ -291,22 +309,40 @@ static void activateApp(pid_t pid) {
     CFRelease(app);
 }
 
+static CGEventRef createSyntheticClick(CGEventType type, CGPoint point,
+                                       int clickState, CGEventFlags flags) {
+    CGEventRef event = CGEventCreateMouseEvent(NULL, type, point, kCGMouseButtonLeft);
+    if (NULL == event) {
+        return NULL;
+    }
+    CGEventSetIntegerValueField(event, kCGMouseEventClickState, clickState);
+    CGEventSetFlags(event, flags);
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, MACPASTE_SYNTHETIC);
+    return event;
+}
+
+// A lone down, for a swallowed click that turned out to be the start of a drag:
+// the hardware up that ends the drag supplies the other half.
+static void postMouseDown(CGPoint point, int clickState, CGEventFlags flags) {
+    CGEventRef mouseClickDown = createSyntheticClick(kCGEventLeftMouseDown, point,
+                                                     clickState, flags);
+    if (NULL == mouseClickDown) {
+        return;
+    }
+    CGEventPost(gTapMouse, mouseClickDown);
+    CFRelease(mouseClickDown);
+}
+
+// Post both halves or neither: a down with no up leaves the app in a tracking
+// loop that reads every later mouse move as a drag, selecting text as it goes.
 static void postClick(CGPoint point, int clickState, CGEventFlags flags) {
-    CGEventRef mouseClickDown = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
-                                                        point, kCGMouseButtonLeft);
-    CGEventRef mouseClickUp = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
-                                                      point, kCGMouseButtonLeft);
-    if (mouseClickDown != NULL) {
-        CGEventSetIntegerValueField(mouseClickDown, kCGMouseEventClickState, clickState);
-        CGEventSetFlags(mouseClickDown, flags);
-    }
-    if (mouseClickUp != NULL) {
-        CGEventSetIntegerValueField(mouseClickUp, kCGMouseEventClickState, clickState);
-        CGEventSetFlags(mouseClickUp, flags);
-    }
+    CGEventRef mouseClickDown = createSyntheticClick(kCGEventLeftMouseDown, point,
+                                                     clickState, flags);
+    CGEventRef mouseClickUp = createSyntheticClick(kCGEventLeftMouseUp, point,
+                                                   clickState, flags);
     if (mouseClickDown != NULL && mouseClickUp != NULL) {
-        CGEventPost(gTapA, mouseClickDown);
-        CGEventPost(gTapA, mouseClickUp);
+        CGEventPost(gTapMouse, mouseClickDown);
+        CGEventPost(gTapMouse, mouseClickUp);
     }
     if (mouseClickDown != NULL) {
         CFRelease(mouseClickDown);
@@ -371,11 +407,13 @@ static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
         if (--ci->attemptsLeft > 0) {
             return; // activation still in flight; the repeating timer retries
         }
+        // Out of attempts. The down was swallowed on the way in, so dropping the
+        // re-post now would lose the click outright; send it regardless. A click
+        // on a window that never came forward is just the ordinary
+        // activate-on-first-click behaviour, so this is safe to fall through to.
         if (gVerbose) {
-            printf("click-through: pid %d never became frontmost, dropping re-post\n", ci->pid);
+            printf("click-through: pid %d never became frontmost, posting anyway\n", ci->pid);
         }
-        endClickThrough(timer, ci);
-        return;
     }
 
     pid_t under = -1;
@@ -420,15 +458,19 @@ static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags fla
     return true;
 }
 
-static void maybeStartClickThrough(CGEventRef event) {
+// Returns true if we are taking over this click: the caller must then swallow
+// the down, because both halves are re-posted together once the app is
+// frontmost. Swallowing one half and passing the other is what leaves an app
+// selecting text under a button the user already released.
+static bool maybeStartClickThrough(CGEventRef event) {
     CGPoint point = CGEventGetLocation(event);
     char name[MAX_WINDOW_NAME_SIZE];
     pid_t pid = -1;
     if (!windowInfoAt(&point, name, sizeof(name), &pid)) {
-        return;
+        return false;
     }
     if (isDockPid(pid)) {
-        return;
+        return false;
     }
     bool frontmost = false;
     if (!readAppFrontmost(pid, &frontmost)) {
@@ -438,20 +480,20 @@ static void maybeStartClickThrough(CGEventRef event) {
             printf("click-through: can't read frontmost state of %s, passing click through\n",
                    name);
         }
-        return;
+        return false;
     }
     if (frontmost) {
         if (gVerbose) {
             printf("click-through: %s already frontmost\n", name);
         }
-        return;
+        return false;
     }
     struct lookup *le = lookupByName(name);
     if (le != NULL && le->noClickThrough) {
         if (gVerbose) {
             printf("click-through: %s excluded\n", name);
         }
-        return;
+        return false;
     }
     int clickState = (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState);
     if (clickState < 1) {
@@ -466,6 +508,7 @@ static void maybeStartClickThrough(CGEventRef event) {
     gClickThroughFlags = CGEventGetFlags(event);
     gClickThroughPid = pid;
     gClickThroughPending = true;
+    return true;
 }
 
 static void nsleep(long long nanos) {
@@ -542,27 +585,11 @@ static void postKeyDownUp(CGKeyCode keycode, CGEventFlags flags) {
 }
 
 static void paste(CGEventRef event) {
-    // Mouse click to focus and position insertion cursor. Posted at the annotated
-    // level (downstream of our own session-level tap) so the posted click never
-    // re-enters this callback and triggers a spurious copy via isDoubleClick().
+    // Mouse click to focus and position the insertion cursor. It carries the
+    // synthetic marker, so coming back through our own tap costs nothing.
     CGPoint mouseLocation = CGEventGetLocation(event);
     if (!isNoFocusWindow(&mouseLocation)) {
-        CGEventRef mouseClickDown = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,
-                                                            mouseLocation,
-                                                            kCGMouseButtonLeft);
-        CGEventRef mouseClickUp = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,
-                                                          mouseLocation,
-                                                          kCGMouseButtonLeft);
-        if (mouseClickDown != NULL && mouseClickUp != NULL) {
-            CGEventPost(gTapA, mouseClickDown);
-            CGEventPost(gTapA, mouseClickUp);
-        }
-        if (mouseClickDown != NULL) {
-            CFRelease(mouseClickDown);
-        }
-        if (mouseClickUp != NULL) {
-            CFRelease(mouseClickUp);
-        }
+        postClick(mouseLocation, 1, 0);
     }
 
     if (isSkipWindow(&mouseLocation)) {
@@ -616,6 +643,14 @@ static CGEventRef mouseCallback (
 ) {
     (void)proxy;
     (void)refcon;
+
+    // Our own posted clicks, echoed back because the session tap sits upstream
+    // of this one. They have already been through this logic once; re-entering
+    // it would start a nested click-through or fake a double-click.
+    if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == MACPASTE_SYNTHETIC) {
+        return event;
+    }
+
     switch (type) {
     case kCGEventOtherMouseDown:
         if (CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber) == 2) {
@@ -628,30 +663,34 @@ static CGEventRef mouseCallback (
         recordClick(gDragStartPoint);
         if (gClickThrough) {
             gClickThroughPending = false; // stale pending from a lost up; start fresh
-            maybeStartClickThrough(event);
+            if (maybeStartClickThrough(event)) {
+                return NULL; // re-posted with its up once the app is frontmost
+            }
         }
         break;
 
     case kCGEventLeftMouseUp:
+        // Still pending means the click stayed a click: a drag would have
+        // released the swallowed down already, below.
         if (gClickThrough && gClickThroughPending) {
             gClickThroughPending = false;
-            if (!gIsDragging) {
-                if (gVerbose) {
-                    printf("click-through: swallowing click, re-posting\n");
-                }
-                if (scheduleClickThrough(gClickThroughPoint, gClickThroughClickState,
-                                         gClickThroughFlags, gClickThroughPid)) {
-                    gIsDragging = false;
-                    return NULL;
-                }
-                // Couldn't schedule the re-post, so don't swallow the up: passing
-                // it through beats silently losing the user's click.
-                if (gVerbose) {
-                    printf("click-through: couldn't schedule re-post, passing click through\n");
-                }
-            } else if (gVerbose) {
-                printf("click-through: click became a drag, passing through\n");
+            if (gVerbose) {
+                printf("click-through: swallowing click, re-posting\n");
             }
+            if (!scheduleClickThrough(gClickThroughPoint, gClickThroughClickState,
+                                      gClickThroughFlags, gClickThroughPid)) {
+                // No re-post is coming, and the down is already swallowed, so
+                // deliver the click now rather than lose it. It goes to a window
+                // that isn't frontmost yet, which is just the ordinary
+                // activate-on-first-click behaviour.
+                if (gVerbose) {
+                    printf("click-through: couldn't schedule re-post, posting click now\n");
+                }
+                postClick(gClickThroughPoint, gClickThroughClickState, gClickThroughFlags);
+            }
+            // Either way this up's down is gone, so it must not go through alone.
+            gIsDragging = false;
+            return NULL;
         }
         if (isDoubleClick() || gIsDragging) {
             copy(event);
@@ -667,6 +706,18 @@ static CGEventRef mouseCallback (
                 p.y - gDragStartPoint.y > DRAG_THRESHOLD_PX ||
                 gDragStartPoint.y - p.y > DRAG_THRESHOLD_PX) {
                 gIsDragging = true;
+                if (gClickThrough && gClickThroughPending) {
+                    // The user is dragging, not clicking, so there is nothing to
+                    // defer: hand the app the down we swallowed, at the point it
+                    // was pressed, and let the rest of the drag and its up run
+                    // normally. Waiting for activation here would eat the drag.
+                    gClickThroughPending = false;
+                    if (gVerbose) {
+                        printf("click-through: click became a drag, releasing the down\n");
+                    }
+                    postMouseDown(gClickThroughPoint, gClickThroughClickState,
+                                  gClickThroughFlags);
+                }
             }
         }
         break;
@@ -683,8 +734,9 @@ static CGEventRef mouseCallback (
         break;
     }
 
-    // Pass on the event; swallow only the up of a click-through click, which is
-    // re-posted later (see scheduleClickThrough) once the app is frontmost.
+    // Pass on the event. The only events swallowed are both halves of a
+    // click-through click, re-posted together (see scheduleClickThrough) once
+    // the app is frontmost.
     return event;
 }
 
