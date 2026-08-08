@@ -5,7 +5,7 @@
 macpaste brings X11-style middle-click copy/paste to macOS: highlight any text, then middle-click anywhere to paste it. The core utility was written in 2016 by **Remik Ziemlinski** (public domain); the original repo has since disappeared, and the code is preserved at [**lodestone/macpaste**](https://github.com/lodestone/macpaste), which this repo is a fork of. On top of that baseline, this fork adds:
 
 - **Click-through (`-t`)** — the first click on a background window now clicks links and buttons instead of only activating the window. No more click-once-to-focus, click-again-to-act.
-- **Per-app controls (`-s`, `-n`, `-x`)** — skip paste handling, skip the focus click, or opt out of click-through for specific apps, matched case-insensitively by app name.
+- **Per-app controls (`-s`, `-n`, `-x`)** — skip paste handling, skip raising and clicking the target window, or opt out of click-through for specific apps, matched case-insensitively by app name.
 - **Works with VMs and remote desktops** — the copy/paste modifier is sent as a real key press rather than only a flag on the key event, so clients that track modifier state the way hardware reports it see Cmd+C instead of a literal `c`. Guest windows can also be skipped outright, which is usually what you want.
 - **Hardened** — fixed crashes and spurious copies, dropped deprecated APIs, and switched to Accessibility-based window detection so only **Accessibility** permission is needed (no screen recording).
 - **Convenience** — Ctrl instead of Cmd (`-c`), verbose logging (`-v`), and `./setup.sh` installs it as a LaunchAgent that starts at login.
@@ -20,8 +20,10 @@ This program assumes that the key combinations Cmd+C/Cmd+V are mapped as copy an
 
 1. Cmd+C down & up (copies your selected text or objects) whenever your left mouse button releases after a drag of more than 5 pixels or after a double-click.
    This allows copying text that is drag highlighted, or double-clicked to highlight words or lines.
-2. Left Mouse Button down & up (position mouse cursor for paste insertion) on middle click.
+2. An Accessibility raise of the window under the pointer, then Left Mouse Button down & up (position mouse cursor for paste insertion) on middle click.
 3. Cmd+V down & up, 15 ms after that click, giving the app time to move its caret first.
+
+The raise in step 2 uses the Accessibility API (`kAXRaiseAction` on the window, then frontmost on its app) rather than relying on the click to bring the window forward. A click aimed at a background window can be consumed by the activation itself, in which case the window comes forward but the caret never moves and the paste lands wherever the caret already was. Raising also names the *exact* window under the pointer; marking the app frontmost alone brings up whichever window that app considers main, which may not be the one you aimed at.
 
 The modifier is sent as a real key press and release around the keystroke, not merely as a flag set on the key event. Native Mac apps accept either, but VM and remote-desktop clients rebuild modifier state from the modifier events real hardware emits; without them the guest receives a bare `c` or `v` and types the letter instead of copying or pasting. See [Virtual machines and remote desktops](#virtual-machines-and-remote-desktops) — those windows usually want to be skipped entirely anyway.
 
@@ -33,7 +35,7 @@ If your mouse is left-handed, or you remapped the keystrokes, then just edit the
 
 #### Optional: Click-through (-t)
 
-Normally macOS swallows the first click on a background window: the window activates, but the click never reaches the content (links, buttons), so you must click a second time. With `-t`, macpaste watches for left clicks on windows of non-frontmost apps, activates the app, and replays the click about 100 ms later, so the first click also acts on the content.
+Normally macOS swallows the first click on a background window: the window activates, but the click never reaches the content (links, buttons), so you must click a second time. With `-t`, macpaste watches for left clicks on windows of non-frontmost apps, raises the window, and replays the click about 100 ms later, so the first click also acts on the content.
 
 Notes:
 
@@ -44,7 +46,8 @@ Notes:
 - Apps with their own click-through (Terminal, iTerm2) still receive exactly one completed click.
 - Double-clicking text in a background window may select a word on the first click instead of just placing the cursor.
 - `-x "App Name"` opts an app out of click-through entirely, e.g. `./macpaste -t -x "Google Chrome"`.
-- macpaste waits for the app to actually become frontmost (polling up to ~0.5s), then re-checks that it still owns whatever is under the cursor. If a dialog appeared, or the window moved or closed while waiting, the click is dropped rather than sent to whatever happens to be there now (`-v` logs this). If the app simply never reports itself frontmost, the click is replayed anyway rather than lost — that is just the ordinary activate-on-first-click behaviour.
+- The window is brought forward with the Accessibility API, not with a synthetic click, and it is the specific window under the pointer that is raised — not just whichever window its app considers main.
+- macpaste waits for the app to actually become frontmost (polling up to ~0.5s), then re-checks that the same window still owns whatever is under the cursor. If a dialog appeared, or the window moved or closed, or a sibling window of the same app came forward over the point while waiting, the click is dropped rather than sent to whatever happens to be there now (`-v` logs this). If the app simply never reports itself frontmost, the click is replayed anyway rather than lost — that is just the ordinary activate-on-first-click behaviour.
 - Whether an app is frontmost is read from that app directly. An app that doesn't report its frontmost state gets no click-through, and its clicks are passed through untouched rather than held back.
 
 ## Virtual machines and remote desktops
@@ -55,7 +58,7 @@ Give VM and remote-desktop windows **both `-s` and `-n`**:
 
 The guest already does its own copy-on-select and middle-click paste, so macpaste only has to stay out of the way. `-s` alone is not enough, for two separate reasons:
 
-- `-s` stops the copy and paste keystrokes, but the focus click is posted *before* the skip check, so a skipped app still receives a stray left click. Inside a guest that click collapses the very selection you were about to paste. `-n` suppresses it.
+- `-s` stops the copy and paste keystrokes, but the raise and focus click happen *before* the skip check, so a skipped app still receives a stray left click. Inside a guest that click collapses the very selection you were about to paste. `-n` suppresses it.
 - The synthesized Cmd arrives in a Linux guest as **Super**, so a middle click fires Super+V at the desktop environment rather than pasting. `-s` stops that.
 
 The names carried in the shipped `run.sh` are `VMware Fusion`, `VirtualBox VM`, `UTM`, `Screen Sharing` and `Royal TSX`. For any other app — or if one of those stops matching — run with `-v` and click the window: macpaste logs the name it resolved, and that is the string to pass.
@@ -81,7 +84,7 @@ Re-running `setup.sh` stops an already-loaded agent first, since it would otherw
 
 -x "App Name" Disables click-through for that application. Only meaningful with -t.
 
--n "App Name" Don't focus window before pasting by simulating left click. This was the default behavior, but causes browsers to do weird things trying to open tabs by middle clicking.
+-n "App Name" Don't raise the window or simulate a left click on it before pasting. Focusing is the default behavior, but the click causes browsers to do weird things trying to open tabs by middle clicking.
 
 -v Verbose mode. Logs some extra info.
 

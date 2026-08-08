@@ -4,8 +4,9 @@
 #
 # VM and remote-desktop windows take both -s and -n. The guest already does its
 # own copy-on-select and middle-click paste, so macpaste has to stay out of the
-# way completely. -s alone isn't enough: paste() posts its focus click before
-# the skip check, and that stray left click lands in the guest and collapses the
+# way completely. -s alone isn't enough: paste() raises the window and posts its
+# focus click before the skip check, and that stray left click lands in the guest
+# and collapses the
 # selection the guest is about to paste. -s also matters more than it looks --
 # the synthesized cmd reaches the guest as Super, so without it a middle click
 # fires Super+V at the desktop environment.

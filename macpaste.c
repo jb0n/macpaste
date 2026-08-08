@@ -15,9 +15,15 @@
 // Terminate with Ctrl+C
 //
 // Optional click-through (-t): a left click on a background window's content is
-// re-posted after the app is activated, so the first click also acts on the
+// re-posted after the window is raised, so the first click also acts on the
 // content (links, buttons) instead of only focusing the window. -x "App" disables
 // this per app. Off by default.
+//
+// Windows are brought forward with the Accessibility API (kAXRaiseAction), never
+// by synthesising a click. A synthetic click can only ask the window server to
+// deliver it and hope the target app treats it as a raise; raising asks the
+// window itself, and names the exact window rather than whichever one its app
+// considers main.
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -64,6 +70,11 @@
 // AXUIElementCopyElementAtPosition on this machine was ~52ms, so keep healthy
 // margin over that; too tight a value silently disables window matching.
 #define AX_MESSAGING_TIMEOUT_SECONDS 0.25f
+// Depth cap for walking an element's parents up to its window, for apps that
+// publish neither kAXWindowAttribute nor kAXTopLevelUIElementAttribute. Real
+// hierarchies are nowhere near this deep; the cap is there so a chain that
+// cycles can't spin inside the event tap callback.
+#define AX_PARENT_WALK_MAX 32
 // Stamped on every mouse event we post. The session tap is upstream of our own
 // tap, so these come straight back to mouseCallback; unmarked, a re-posted click
 // would look like a fresh user click and start a second click-through, or land
@@ -95,6 +106,7 @@ static CGPoint gClickThroughPoint;
 static int gClickThroughClickState = 1;
 static CGEventFlags gClickThroughFlags = 0;
 static pid_t gClickThroughPid = -1;
+static AXUIElementRef gClickThroughWindow = NULL; // retained while a click is pending
 
 struct lookup {
     bool skipWindow;
@@ -221,7 +233,75 @@ static bool displayNameForExecutable(const char *execPath, char *buf, size_t buf
     return true;
 }
 
-static bool windowInfoAt(CGPoint *mouse, char *buf, size_t buf_len, pid_t *pid_out) {
+static bool elementIsWindow(AXUIElementRef el) {
+    CFTypeRef role = NULL;
+    if (AXUIElementCopyAttributeValue(el, kAXRoleAttribute, &role) != kAXErrorSuccess ||
+        role == NULL) {
+        return false;
+    }
+    bool isWindow = CFGetTypeID(role) == CFStringGetTypeID() && CFEqual(role, kAXWindowRole);
+    CFRelease(role);
+    return isWindow;
+}
+
+// The window containing a hit-tested element. AXUIElementCopyElementAtPosition()
+// answers with the deepest thing under the point -- a button, a table cell -- and
+// it is the window above it that can be raised. Most apps publish a shortcut
+// attribute straight to it; the rest have to be climbed. Returns a retained
+// element, or NULL if the window can't be resolved.
+static AXUIElementRef copyWindowForElement(AXUIElementRef el) {
+    if (elementIsWindow(el)) {
+        return (AXUIElementRef)CFRetain(el);
+    }
+    CFStringRef shortcuts[2];
+    shortcuts[0] = kAXWindowAttribute;
+    shortcuts[1] = kAXTopLevelUIElementAttribute;
+    for (size_t i = 0; i < sizeof(shortcuts) / sizeof(shortcuts[0]); i++) {
+        CFTypeRef win = NULL;
+        if (AXUIElementCopyAttributeValue(el, shortcuts[i], &win) != kAXErrorSuccess ||
+            win == NULL) {
+            continue;
+        }
+        if (CFGetTypeID(win) == AXUIElementGetTypeID() &&
+            elementIsWindow((AXUIElementRef)win)) {
+            return (AXUIElementRef)win;
+        }
+        CFRelease(win);
+    }
+    // Bounded climb: a malformed parent chain that cycles would otherwise spin
+    // here, and this runs inside the event tap callback.
+    AXUIElementRef cur = (AXUIElementRef)CFRetain(el);
+    for (int depth = 0; depth < AX_PARENT_WALK_MAX; depth++) {
+        CFTypeRef parent = NULL;
+        if (AXUIElementCopyAttributeValue(cur, kAXParentAttribute, &parent) != kAXErrorSuccess ||
+            parent == NULL) {
+            break;
+        }
+        CFRelease(cur);
+        if (CFGetTypeID(parent) != AXUIElementGetTypeID()) {
+            CFRelease(parent);
+            return NULL;
+        }
+        cur = (AXUIElementRef)parent;
+        if (elementIsWindow(cur)) {
+            return cur;
+        }
+    }
+    CFRelease(cur);
+    return NULL;
+}
+
+// One hit test answers everything a caller can want about the window under the
+// pointer: the owning process, its display name, and a handle on the window
+// itself. AXUIElementCopyElementAtPosition() is synchronous IPC into the target
+// app and the slowest thing we do, so callers that need more than one of those
+// must not pay for it twice. On failure nothing is returned and *win_out is
+// left NULL; on success *win_out may still be NULL if the window didn't resolve.
+static bool windowContextAt(CGPoint *mouse, char *buf, size_t buf_len,
+                            pid_t *pid_out, AXUIElementRef *win_out) {
+    if (win_out != NULL) {
+        *win_out = NULL;
+    }
     AXUIElementRef el = NULL;
     AXError err = AXUIElementCopyElementAtPosition(gSystemWide,
                                                    (float)mouse->x, (float)mouse->y, &el);
@@ -230,26 +310,32 @@ static bool windowInfoAt(CGPoint *mouse, char *buf, size_t buf_len, pid_t *pid_o
     }
     pid_t pid = 0;
     err = AXUIElementGetPid(el, &pid);
-    CFRelease(el);
     if (err != kAXErrorSuccess || pid <= 0) {
+        CFRelease(el);
         return false;
     }
+    // Name before window: it needs no further AX round trip, so a failed name
+    // lookup costs nothing and cannot strand a retained window element.
+    if (buf != NULL) {
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(pid, path, sizeof(path)) <= 0 ||
+            !displayNameForExecutable(path, buf, buf_len)) {
+            CFRelease(el);
+            return false;
+        }
+    }
+    if (win_out != NULL) {
+        *win_out = copyWindowForElement(el);
+    }
+    CFRelease(el);
     if (pid_out != NULL) {
         *pid_out = pid;
     }
-    if (buf == NULL) {
-        return true;
-    }
-    char path[PROC_PIDPATHINFO_MAXSIZE];
-    int len = proc_pidpath(pid, path, sizeof(path));
-    if (len <= 0) {
-        return false;
-    }
-    return displayNameForExecutable(path, buf, buf_len);
+    return true;
 }
 
 static bool windowNameAt(CGPoint *mouse, char *buf, size_t buf_len) {
-    return windowInfoAt(mouse, buf, buf_len, NULL);
+    return windowContextAt(mouse, buf, buf_len, NULL, NULL);
 }
 
 static struct lookup *lookupByName(const char *name) {
@@ -285,11 +371,6 @@ static bool isSkipWindow(CGPoint *mouse) {
     return (le != NULL) && le->skipWindow;
 }
 
-static bool isNoFocusWindow(CGPoint *mouse) {
-    struct lookup *le = windowLookup(mouse);
-    return (le != NULL) && le->noFocus;
-}
-
 static bool isDockPid(pid_t pid) {
     char path[PROC_PIDPATHINFO_MAXSIZE];
     if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
@@ -300,6 +381,21 @@ static bool isDockPid(pid_t pid) {
     return strcmp(base, "Dock") == 0;
 }
 
+static void releaseWindow(AXUIElementRef *win) {
+    if (*win != NULL) {
+        CFRelease(*win);
+        *win = NULL;
+    }
+}
+
+// Drop a click-through that never made it to the re-post: the window element is
+// retained for as long as the click is pending, so every path that clears the
+// pending flag has to go through here or leak one element per click.
+static void clearPendingClickThrough(void) {
+    gClickThroughPending = false;
+    releaseWindow(&gClickThroughWindow);
+}
+
 static void activateApp(pid_t pid) {
     AXUIElementRef app = AXUIElementCreateApplication(pid);
     if (NULL == app) {
@@ -307,6 +403,28 @@ static void activateApp(pid_t pid) {
     }
     AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
     CFRelease(app);
+}
+
+// Bring a specific window forward without synthesising a click. kAXRaiseAction
+// is the window's own "come to the front" verb, so it moves the exact window
+// under the pointer; kAXFrontmostAttribute on the app only says which app is in
+// front, and the app answers that by raising whichever window it considers main.
+// For a background window of a background app those are different windows, and
+// activating alone can leave the clicked window behind a sibling that just came
+// forward over it. Do both, window first: right window within the app, right app
+// on screen. Both calls are synchronous IPC, so by the time this returns the app
+// has at least processed the request.
+static void raiseWindow(AXUIElementRef win, pid_t pid) {
+    if (win != NULL) {
+        AXUIElementPerformAction(win, kAXRaiseAction);
+        // Raising orders the window on screen; main is what makes it the window
+        // the app treats as its active one, which is the other half of what a
+        // click on the title bar would have done.
+        AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
+    }
+    if (pid > 0) {
+        activateApp(pid);
+    }
 }
 
 static CGEventRef createSyntheticClick(CGEventType type, CGPoint point,
@@ -357,6 +475,7 @@ struct clickThroughInfo {
     int clickState;
     CGEventFlags flags;
     pid_t pid;
+    AXUIElementRef window; // the window the click was aimed at; may be NULL
     int attemptsLeft;
 };
 
@@ -389,9 +508,33 @@ static bool readAppFrontmost(pid_t pid, bool *frontmost) {
 }
 
 static void endClickThrough(CFRunLoopTimerRef timer, struct clickThroughInfo *ci) {
+    releaseWindow(&ci->window);
     free(ci);
     CFRunLoopTimerInvalidate(timer);
     CFRelease(timer);
+}
+
+// Does the window we aimed at still own the click point? Comparing pids alone
+// isn't enough: activating an app can bring one of its other windows forward
+// over the point, and the click would then land on a window the user never
+// aimed at -- the same wrong-target problem as a dialog appearing, but from a
+// sibling of the intended window, so the pid check waves it through. Falls back
+// to the pid comparison whenever either window is unknown, because refusing to
+// post here would lose a click that was already swallowed on the way in.
+static bool stillOwnsPoint(struct clickThroughInfo *ci, pid_t *under_out) {
+    pid_t under = -1;
+    AXUIElementRef underWin = NULL;
+    if (!windowContextAt(&ci->point, NULL, 0, &under, &underWin)) {
+        *under_out = under;
+        return false;
+    }
+    *under_out = under;
+    bool same = (under == ci->pid);
+    if (same && ci->window != NULL && underWin != NULL) {
+        same = CFEqual(ci->window, underWin);
+    }
+    releaseWindow(&underWin);
+    return same;
 }
 
 // Re-post the swallowed click once the target app is actually frontmost, and
@@ -417,7 +560,7 @@ static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
     }
 
     pid_t under = -1;
-    if (windowInfoAt(&ci->point, NULL, 0, &under) && under == ci->pid) {
+    if (stillOwnsPoint(ci, &under)) {
         postClick(ci->point, ci->clickState, ci->flags);
     } else if (gVerbose) {
         printf("click-through: pid %d no longer owns the click point (now %d), "
@@ -426,15 +569,20 @@ static void clickThroughTimerCallback(CFRunLoopTimerRef timer, void *info) {
     endClickThrough(timer, ci);
 }
 
-static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags flags, pid_t pid) {
+// Consumes `win` either way: on success the timer owns it, on failure it is
+// released here, so the caller must not touch it again.
+static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags flags,
+                                 pid_t pid, AXUIElementRef win) {
     struct clickThroughInfo *ci = malloc(sizeof(*ci));
     if (NULL == ci) {
+        releaseWindow(&win);
         return false;
     }
     ci->point = point;
     ci->clickState = clickState;
     ci->flags = flags;
     ci->pid = pid;
+    ci->window = win;
     ci->attemptsLeft = CLICK_THROUGH_MAX_ATTEMPTS;
     CFRunLoopTimerContext context;
     context.version = 0;
@@ -451,6 +599,7 @@ static bool scheduleClickThrough(CGPoint point, int clickState, CGEventFlags fla
         clickThroughTimerCallback,
         &context);
     if (NULL == timer) {
+        releaseWindow(&ci->window);
         free(ci);
         return false;
     }
@@ -466,10 +615,14 @@ static bool maybeStartClickThrough(CGEventRef event) {
     CGPoint point = CGEventGetLocation(event);
     char name[MAX_WINDOW_NAME_SIZE];
     pid_t pid = -1;
-    if (!windowInfoAt(&point, name, sizeof(name), &pid)) {
+    AXUIElementRef win = NULL;
+    if (!windowContextAt(&point, name, sizeof(name), &pid, &win)) {
         return false;
     }
+    // Every path below this point either hands `win` to the pending state or
+    // drops the click-through, so each early return has to let it go.
     if (isDockPid(pid)) {
+        releaseWindow(&win);
         return false;
     }
     bool frontmost = false;
@@ -480,12 +633,14 @@ static bool maybeStartClickThrough(CGEventRef event) {
             printf("click-through: can't read frontmost state of %s, passing click through\n",
                    name);
         }
+        releaseWindow(&win);
         return false;
     }
     if (frontmost) {
         if (gVerbose) {
             printf("click-through: %s already frontmost\n", name);
         }
+        releaseWindow(&win);
         return false;
     }
     struct lookup *le = lookupByName(name);
@@ -493,6 +648,7 @@ static bool maybeStartClickThrough(CGEventRef event) {
         if (gVerbose) {
             printf("click-through: %s excluded\n", name);
         }
+        releaseWindow(&win);
         return false;
     }
     int clickState = (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState);
@@ -500,13 +656,15 @@ static bool maybeStartClickThrough(CGEventRef event) {
         clickState = 1;
     }
     if (gVerbose) {
-        printf("click-through: activating pid %d (%s)\n", pid, name);
+        printf("click-through: raising pid %d (%s)%s\n", pid, name,
+               win != NULL ? "" : " [no window element; app-level activate only]");
     }
-    activateApp(pid);
+    raiseWindow(win, pid);
     gClickThroughPoint = point;
     gClickThroughClickState = clickState;
     gClickThroughFlags = CGEventGetFlags(event);
     gClickThroughPid = pid;
+    gClickThroughWindow = win; // handed to scheduleClickThrough on mouse up
     gClickThroughPending = true;
     return true;
 }
@@ -585,14 +743,35 @@ static void postKeyDownUp(CGKeyCode keycode, CGEventFlags flags) {
 }
 
 static void paste(CGEventRef event) {
-    // Mouse click to focus and position the insertion cursor. It carries the
-    // synthetic marker, so coming back through our own tap costs nothing.
     CGPoint mouseLocation = CGEventGetLocation(event);
-    if (!isNoFocusWindow(&mouseLocation)) {
-        postClick(mouseLocation, 1, 0);
+
+    // One hit test for both -n and -s and for the window to raise. Each check
+    // used to run its own, which meant two rounds of synchronous IPC into the
+    // target app on every middle click.
+    char name[MAX_WINDOW_NAME_SIZE];
+    pid_t pid = -1;
+    AXUIElementRef win = NULL;
+    struct lookup *le = NULL;
+    if (windowContextAt(&mouseLocation, name, sizeof(name), &pid, &win)) {
+        le = lookupByName(name);
+    } else if (gVerbose) {
+        printf("no window\n");
     }
 
-    if (isSkipWindow(&mouseLocation)) {
+    if (le == NULL || !le->noFocus) {
+        // Raise first, click second. The click used to do both jobs -- bring the
+        // window forward and put the caret where you clicked -- and an app that
+        // declines a click aimed at its background window does the first and
+        // skips the second, so the paste landed wherever the caret already was.
+        // Raising needs no click, which leaves the click free to do only the one
+        // thing no API can do for it: move the caret. The click carries the
+        // synthetic marker, so coming back through our own tap costs nothing.
+        raiseWindow(win, pid);
+        postClick(mouseLocation, 1, 0);
+    }
+    releaseWindow(&win);
+
+    if (le != NULL && le->skipWindow) {
         return;
     }
 
@@ -662,7 +841,7 @@ static CGEventRef mouseCallback (
         gDragStartPoint = CGEventGetLocation(event);
         recordClick(gDragStartPoint);
         if (gClickThrough) {
-            gClickThroughPending = false; // stale pending from a lost up; start fresh
+            clearPendingClickThrough(); // stale pending from a lost up; start fresh
             if (maybeStartClickThrough(event)) {
                 return NULL; // re-posted with its up once the app is frontmost
             }
@@ -674,11 +853,13 @@ static CGEventRef mouseCallback (
         // released the swallowed down already, below.
         if (gClickThrough && gClickThroughPending) {
             gClickThroughPending = false;
+            AXUIElementRef win = gClickThroughWindow; // ownership moves to the timer
+            gClickThroughWindow = NULL;
             if (gVerbose) {
                 printf("click-through: swallowing click, re-posting\n");
             }
             if (!scheduleClickThrough(gClickThroughPoint, gClickThroughClickState,
-                                      gClickThroughFlags, gClickThroughPid)) {
+                                      gClickThroughFlags, gClickThroughPid, win)) {
                 // No re-post is coming, and the down is already swallowed, so
                 // deliver the click now rather than lose it. It goes to a window
                 // that isn't frontmost yet, which is just the ordinary
@@ -711,7 +892,7 @@ static CGEventRef mouseCallback (
                     // defer: hand the app the down we swallowed, at the point it
                     // was pressed, and let the rest of the drag and its up run
                     // normally. Waiting for activation here would eat the drag.
-                    gClickThroughPending = false;
+                    clearPendingClickThrough();
                     if (gVerbose) {
                         printf("click-through: click became a drag, releasing the down\n");
                     }
@@ -783,8 +964,8 @@ static void usage(const char *prog) {
             "  -v         verbose logging\n"
             "  -c         use ctrl instead of cmd for the synthesized copy/paste\n"
             "  -t         enable click-through: the first click on a background\n"
-            "             window is re-posted after its app is activated\n"
-            "  -n name    don't focus (click) windows of this app before pasting\n"
+            "             window is re-posted after its window is raised\n"
+            "  -n name    don't raise or click windows of this app before pasting\n"
             "  -s name    skip this app entirely (no copy, no paste)\n"
             "  -x name    exclude this app from click-through (requires -t)\n"
             "  -h         show this help\n"
