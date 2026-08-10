@@ -107,8 +107,12 @@ The author's daily config, showing `-t`/`-s`/`-n` in practice:
 #
 # Google Chrome, Slack   -n only: a synthetic left click can open a tab, or
 #                        drop focus out of the composer.
-# iTerm2, Terminal       -s: they already paste on middle click, so macpaste
-#                        would paste a second time.
+# iTerm2, Terminal,      -s: they already paste on middle click, so macpaste
+# Ghostty                would paste a second time. Ghostty's middle-click
+#                        paste can't be turned off, and it reads its own
+#                        selection clipboard, so set copy-on-select = clipboard
+#                        in ~/.config/ghostty/config to keep selected text
+#                        reaching other apps.
 # Finder, uTorrent       -s: no text target to paste into.
 ./macpaste -v -t \
     -s "VMware Fusion" \
@@ -126,6 +130,7 @@ The author's daily config, showing `-t`/`-s`/`-n` in practice:
     -s uTorrent \
     -s iTerm2 \
     -s Terminal \
+    -s Ghostty \
     -s Finder
 ```
 

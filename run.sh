@@ -26,4 +26,5 @@
     -s uTorrent \
     -s iTerm2 \
     -s Terminal \
+    -s Ghostty \
     -s Finder
